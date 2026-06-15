@@ -12,7 +12,7 @@ set -e
 # Command line arguments (with defaults)
 # =============================================================================
 
-BATCH_SIZE=${1:-64}
+BATCH_SIZE=${1:-16}
 LEARNING_COEF=${2:-0.1}
 OUTPUT_DIR=${3:-./runs/simvla_libero_large}
 RESUME_CKPT=${4:-""}
@@ -24,7 +24,8 @@ echo "   output_dir: $OUTPUT_DIR"
 echo "   resume_ckpt: ${RESUME_CKPT:-'None (training from scratch)'}"
 
 # GPU configuration
-export CUDA_VISIBLE_DEVICES=4,5,6,7
+# export CUDA_VISIBLE_DEVICES=4,5,6,7
+export CUDA_VISIBLE_DEVICES=0
 
 # Suppress TensorFlow logs
 export TF_CPP_MIN_LOG_LEVEL=2
@@ -144,7 +145,7 @@ echo "============================================================"
 # Multi-GPU training
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 accelerate launch \
-    --num_processes=4 \
+    --num_processes=1 \
     --main_process_port 29504 \
     --mixed_precision bf16 \
     train_smolvlm.py ${ARGS}
