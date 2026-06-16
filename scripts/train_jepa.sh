@@ -102,7 +102,7 @@ if ls "${OUTPUT_DIR}"/ckpt-*/model.safetensors 2>/dev/null | grep -q .; then
 fi
 
 # ── Training ─────────────────────────────────────────────────
-cd "$(dirname "$0")/.." || exit 1
+cd "$SLURM_SUBMIT_DIR" || exit 1
 
 torchrun \
     --nproc_per_node=4 \
