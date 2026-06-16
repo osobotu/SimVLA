@@ -2,13 +2,31 @@
 SmolVLM-VLA Model
 
 HuggingFace-compatible Vision-Language-Action policy using SmolVLM-500M-Instruct
-as the visual-language backbone.
+as the visual-language backbone, with a pluggable perception encoder.
 
-Key differences from FlorenceVLA:
-  - Uses SmolVLM-500M-Instruct (efficient 500M parameter model)
-  - 512x512 image input (SmolVLM-500M uses 512x512 patches)
-  - All views processed together by SmolVLM, no aux_visual_inputs
-  - Unified VLM output for multi-view inputs
+Encoder abstraction
+-------------------
+All vision encoding is delegated to `self.encoder` (a PerceptionEncoder subclass).
+The interface contract is:
+
+    encoder(pixel_values, image_mask, input_ids)
+        -> {"vlm_features": [B, T_enc, D]}
+
+For encoder_name="smolvlm" (baseline B0): SmolVLMEncoder wraps the original
+forward_vlm_efficient logic unchanged. The SmolVLM weights live in `self.vlm`
+(parameter owner). SmolVLMEncoder holds a non-registered reference so the
+state-dict layout ("vlm.*") is preserved and old checkpoints remain loadable.
+
+For encoder_name in {dinov2, ijepa, vjepa2}: the new backbone lives in
+`self.encoder.backbone` + `self.encoder.connector`. The SmolLM text_model
+(in `self.vlm`) is shared for language fusion. SigLIP vision_model inside
+self.vlm is frozen (unused) for non-smolvlm encoders.
+
+Temporal clips (V-JEPA 2)
+--------------------------
+When the dataset is configured with num_frames > 1, pixel_values has shape
+[B, V, T, C, H, W]. SmolVLMEncoder / DINOv2Encoder / IJEPAEncoder discard
+all but the last frame (current timestep). VJEPA2Encoder processes all T frames.
 """
 
 from __future__ import annotations
@@ -30,6 +48,7 @@ from transformers import PreTrainedModel, AutoProcessor, AutoModelForImageTextTo
 from .transformer_smolvlm import SmolVLMActionTransformer
 from .action_hub import build_action_space
 from .configuration_smolvlm_vla import SmolVLMVLAConfig
+from .encoders import build_encoder
 
 
 class SmolVLMVLA(PreTrainedModel):
@@ -37,14 +56,10 @@ class SmolVLMVLA(PreTrainedModel):
     SmolVLM-VLA: HuggingFace-compatible Vision-Language-Action policy.
 
     Components:
-      • SmolVLM-500M-Instruct backbone (vision-language)
-      • SmolVLMActionTransformer (flow matching action head)
-      • Action space (pre/post-processing + loss)
-      
-    Key differences from FlorenceVLA:
-      • All camera views are input to VLM together (no aux_visual_inputs)
-      • 512x512 image resolution (SmolVLM-500M uses 512x512 patches)
-      • Efficient 500M parameter model
+      • self.vlm  — SmolVLM-500M-Instruct (always loaded; owns SmolLM weights)
+      • self.encoder — pluggable PerceptionEncoder (smolvlm | dinov2 | ijepa | vjepa2)
+      • self.transformer — SmolVLMActionTransformer (flow matching action head)
+      • self.action_space — action pre/post-processing + loss
     """
     config_class = SmolVLMVLAConfig
     base_model_prefix = "smolvlm_vla"
@@ -53,39 +68,52 @@ class SmolVLMVLA(PreTrainedModel):
     def __init__(self, config: SmolVLMVLAConfig, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
 
-        # Core settings
         self.num_actions: int = config.num_actions
         self.use_proprio: bool = config.use_proprio
         self.action_mode: str = config.action_mode.lower()
         self.image_size: int = config.image_size
         self.num_views: int = config.num_views
-        
+
         # Action space
         self.action_space = build_action_space(config.action_mode.lower())
         dim_action = self.action_space.dim_action
         dim_proprio = getattr(self.action_space, "dim_proprio", dim_action)
 
-        # SmolVLM backbone
+        # ── SmolVLM (always loaded — owns LM weights regardless of encoder) ──
         logging.info(f"Loading SmolVLM from: {config.smolvlm_model_path}")
         self.vlm = AutoModelForImageTextToText.from_pretrained(
             config.smolvlm_model_path,
-            torch_dtype=torch.float32,  # Use float32 for training stability
+            torch_dtype=torch.float32,
             trust_remote_code=True,
         )
         self.vlm_processor = AutoProcessor.from_pretrained(
             config.smolvlm_model_path,
             trust_remote_code=True,
         )
-        
-        # Get SmolVLM hidden size from model config
-        # SmolVLM-500M has hidden_size from text_config
-        vlm_hidden_size = self.vlm.config.text_config.hidden_size
-        logging.info(f"SmolVLM hidden size: {vlm_hidden_size}")
 
-        # DiT/AdaLN mode setting
-        self.use_adaln = getattr(config, 'use_adaln', False)
-        
-        # Flow matching action head (SmolVLM version - no aux_visual)
+        # For non-smolvlm encoders: freeze SigLIP (unused in forward pass)
+        encoder_name = getattr(config, "encoder_name", "smolvlm")
+        if encoder_name != "smolvlm":
+            logging.info(
+                f"encoder_name='{encoder_name}': freezing SigLIP "
+                "(self.vlm.model.vision_model + connector — unused by this encoder)"
+            )
+            for p in self.vlm.model.vision_model.parameters():
+                p.requires_grad_(False)
+            if hasattr(self.vlm.model, "connector"):
+                for p in self.vlm.model.connector.parameters():
+                    p.requires_grad_(False)
+
+        # ── Pluggable perception encoder ──
+        logging.info(f"Building encoder: '{encoder_name}'")
+        self.encoder = build_encoder(encoder_name, config, vlm=self.vlm)
+        vlm_hidden_size: int = self.encoder.output_dim
+        logging.info(f"Encoder output_dim: {vlm_hidden_size}")
+
+        # ── DiT/AdaLN mode ──
+        self.use_adaln = getattr(config, "use_adaln", False)
+
+        # ── Flow matching action head ──
         self.transformer = SmolVLMActionTransformer(
             hidden_size=config.hidden_size,
             vlm_hidden_size=vlm_hidden_size,
@@ -98,76 +126,89 @@ class SmolVLMVLA(PreTrainedModel):
             max_len_seq=config.max_len_seq,
             use_adaln=self.use_adaln,
         )
-        
-        if self.use_adaln:
-            logging.info("✓ DiT/AdaLN mode enabled: conditions injected via Adaptive Layer Norm")
-        else:
-            logging.info("✓ Concat mode enabled: conditions concatenated to sequence")
 
-        # Deferred FastAPI app
+        if self.use_adaln:
+            logging.info("DiT/AdaLN mode enabled")
+        else:
+            logging.info("Concat mode enabled")
+
         self.app: FastAPI | None = None
 
-    # ============================= SmolVLM encoder =============================
-    def forward_vlm(
+    # ========================= parameter grouping helper ====================
+
+    def vlm_parameters(self):
+        """
+        Parameters belonging to the language-model portion of self.vlm.
+
+        For encoder_name="smolvlm": returns all vlm params (SigLIP + LLM).
+        For other encoders: returns only text_model params (LLM);
+            SigLIP params are frozen and excluded to avoid wasted optimizer state.
+        """
+        encoder_name = getattr(self.config, "encoder_name", "smolvlm")
+        if encoder_name == "smolvlm":
+            return list(self.vlm.parameters())
+        # Only the text model trains; SigLIP is frozen (requires_grad=False)
+        return [p for p in self.vlm.model.text_model.parameters()]
+
+    # ========================= perception forward ===========================
+
+    def forward_vlm_efficient(
         self,
-        pixel_values: torch.FloatTensor,    # [B, V, C, H, W] - multi-view images
-        image_mask: torch.Tensor,           # [B, V] (bool or 0/1)
-        language_instruction: list[str] | None = None,  # Optional text prompts
+        pixel_values: torch.FloatTensor,    # [B, V, C, H, W] or [B, V, T, C, H, W]
+        image_mask: torch.Tensor,           # [B, V]
+        input_ids: torch.LongTensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        Encode multi-view images via SmolVLM2.
-        
-        All views are processed together by SmolVLM, producing unified features.
-        No aux_visual_inputs needed - everything goes through VLM.
+        Delegate to the pluggable encoder.
+        Returns {"vlm_features": [B, T_enc, D]}.
+        """
+        return self.encoder(pixel_values, image_mask, input_ids)
 
-        Returns:
-          { "vlm_features": [B, T_enc, D] }
+    # ====================== legacy (non-efficient) path =====================
+
+    def forward_vlm(
+        self,
+        pixel_values: torch.FloatTensor,
+        image_mask: torch.Tensor,
+        language_instruction: list[str] | None = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Slow VLM forward (PIL round-trip). Kept for compatibility; not used
+        in training. Non-smolvlm encoders are not supported here.
         """
         if pixel_values.dim() == 6:
             if pixel_values.size(2) == 1:
                 pixel_values = pixel_values.squeeze(2)
             else:
                 pixel_values = pixel_values[:, :, 0]
-            
+
         B, V, C, H, W = pixel_values.shape
         device = pixel_values.device
-        
-        # Prepare images for SmolVLM - flatten views and filter by mask
-        # SmolVLM can handle multiple images as part of multi-image inference
+
         batch_features = []
-        
+
         for b in range(B):
-            # Get valid images for this sample
             valid_mask = image_mask[b].bool()
-            valid_images = pixel_values[b][valid_mask]  # [num_valid, C, H, W]
-            
+            valid_images = pixel_values[b][valid_mask]
+
             if valid_images.shape[0] == 0:
                 raise ValueError("At least one image view must be valid per batch.")
-            
-            # Convert to PIL images for SmolVLM processor
+
             pil_images = []
             for img_tensor in valid_images:
-                # Denormalize and convert to PIL
                 img_np = img_tensor.permute(1, 2, 0).cpu().numpy()
-                # Assuming normalized with ImageNet stats, denormalize
                 img_np = img_np * np.array([0.229, 0.224, 0.225]) + np.array([0.485, 0.456, 0.406])
                 img_np = (img_np * 255).clip(0, 255).astype(np.uint8)
                 pil_images.append(Image.fromarray(img_np))
-            
-            # Build message for SmolVLM with multiple images
-            content = []
-            for i, img in enumerate(pil_images):
-                content.append({"type": "image", "image": img})
-            
-            # Add text prompt if provided
+
+            content = [{"type": "image", "image": img} for img in pil_images]
             if language_instruction is not None and b < len(language_instruction):
                 content.append({"type": "text", "text": language_instruction[b]})
             else:
                 content.append({"type": "text", "text": "Describe the robot's observation."})
-            
+
             messages = [{"role": "user", "content": content}]
-            
-            # Process with SmolVLM
+
             inputs = self.vlm_processor.apply_chat_template(
                 messages,
                 add_generation_prompt=True,
@@ -175,215 +216,87 @@ class SmolVLMVLA(PreTrainedModel):
                 return_dict=True,
                 return_tensors="pt",
             ).to(device)
-            
-            # Get encoder outputs (hidden states) instead of generating text
+
             with torch.no_grad():
                 outputs = self.vlm(
                     **inputs,
                     output_hidden_states=True,
                     return_dict=True,
                 )
-            
-            # Use the last hidden state as features
-            # Shape: [1, seq_len, hidden_size]
+
             hidden_states = outputs.hidden_states[-1]
-            batch_features.append(hidden_states.squeeze(0))  # [seq_len, hidden_size]
-        
-        # Pad to same length and stack
+            batch_features.append(hidden_states.squeeze(0))
+
         max_len = max(f.shape[0] for f in batch_features)
         hidden_size = batch_features[0].shape[-1]
-        
+
         padded_features = torch.zeros(B, max_len, hidden_size, device=device, dtype=batch_features[0].dtype)
         for b, feat in enumerate(batch_features):
             padded_features[b, :feat.shape[0]] = feat
-        
+
         return {"vlm_features": padded_features}
 
-    def forward_vlm_efficient(
-        self,
-        pixel_values: torch.FloatTensor,    # [B, V, C, H, W] - Already preprocessed
-        image_mask: torch.Tensor,           # [B, V]
-        input_ids: torch.LongTensor | None = None,  # [B, L] - Pre-tokenized text
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Efficient VLM forward for training - uses FULL VLM to fuse vision and language.
-        
-        Key improvement: Uses complete VLM forward (vision encoder + language model)
-        to get features that fuse visual and linguistic information, rather than
-        just using the vision encoder alone.
-        
-        Pipeline:
-          pixel_values → vision_encoder → image_features
-                                               ↓
-          input_ids → text_embeddings ─────────┤
-                                               ↓
-                                 [image_feats, text_embeds] (concat)
-                                               ↓
-                                 language_model forward
-                                               ↓
-                                 fused VLM features → return
-        
-        Returns:
-          { "vlm_features": [B, T_enc, D] }
-        """
-        if pixel_values.dim() == 6:
-            if pixel_values.size(2) == 1:
-                pixel_values = pixel_values.squeeze(2)
-            else:
-                pixel_values = pixel_values[:, :, 0]
-        B, V, C, H, W = pixel_values.shape
-        device = pixel_values.device
-        dtype = pixel_values.dtype
-        
-        # ========== Step 1: Get vision features ==========
-        # Flatten images: [B, V, C, H, W] -> [B*V, C, H, W]
-        flat_images = pixel_values.flatten(0, 1)
-        flat_mask = image_mask.view(-1).bool()
-        
-        # Get valid images
-        valid_images = flat_images[flat_mask]  # [num_valid, C, H, W]
-        
-        if valid_images.shape[0] == 0:
-            raise ValueError("At least one image view must be valid.")
-        
-        # Encode images through SmolVLM's vision encoder (SigLIP)
-        vision_outputs = self.vlm.model.vision_model(
-            pixel_values=valid_images,
-            output_hidden_states=True,
-            return_dict=True,
-        )
-        
-        # Get image features and project to LM space
-        image_features = vision_outputs.last_hidden_state  # [num_valid, num_patches, vision_hidden]
-        
-        # Project to language model space using the connector/projector
-        if hasattr(self.vlm.model, 'connector'):
-            image_features = self.vlm.model.connector(image_features)
-        elif hasattr(self.vlm.model, 'multi_modal_projector'):
-            image_features = self.vlm.model.multi_modal_projector(image_features)
-        
-        # ========== Step 2: Get text embeddings ==========
-        # Idefics3 (SmolVLM) uses 'text_model' instead of 'language_model'
-        text_embeds = self.vlm.model.text_model.get_input_embeddings()(input_ids)  # [B, L, D]
-        
-        # ========== Step 3: Build combined sequence per sample ==========
-        # For each sample, concatenate: [image_features_view1, ..., image_features_viewN, text_embeds]
-        hidden_size = image_features.shape[-1]
-        num_patches = image_features.shape[1]
-        
-        # Reconstruct image features with batch structure
-        full_image_features = image_features.new_zeros(B * V, num_patches, hidden_size)
-        full_image_features[flat_mask] = image_features
-        full_image_features = full_image_features.view(B, V, num_patches, hidden_size)
-        
-        # Count valid views per sample for proper concatenation
-        valid_per_sample = image_mask.sum(dim=1).int()  # [B]
-        
-        batch_inputs_embeds = []
-        max_seq_len = 0
-        
-        for b in range(B):
-            # Get valid image features for this sample
-            num_valid = valid_per_sample[b].item()
-            sample_image_feats = full_image_features[b, :num_valid]  # [num_valid, num_patches, D]
-            sample_image_feats = sample_image_feats.reshape(-1, hidden_size)  # [num_valid*num_patches, D]
-            
-            # Get text embeddings for this sample
-            sample_text_embeds = text_embeds[b]  # [L, D]
-            
-            # Concatenate: [image_features, text_embeds]
-            combined = torch.cat([sample_image_feats, sample_text_embeds], dim=0)  # [T, D]
-            batch_inputs_embeds.append(combined)
-            max_seq_len = max(max_seq_len, combined.shape[0])
-        
-        # ========== Step 4: Pad and stack ==========
-        padded_inputs_embeds = torch.zeros(B, max_seq_len, hidden_size, device=device, dtype=dtype)
-        attention_mask = torch.zeros(B, max_seq_len, device=device, dtype=torch.long)
-        
-        for b, embeds in enumerate(batch_inputs_embeds):
-            seq_len = embeds.shape[0]
-            padded_inputs_embeds[b, :seq_len] = embeds
-            attention_mask[b, :seq_len] = 1
-        
-        # ========== Step 5: Forward through text model (Idefics3/SmolVLM) ==========
-        # This fuses visual and linguistic information through the full transformer
-        lm_outputs = self.vlm.model.text_model(
-            inputs_embeds=padded_inputs_embeds,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            return_dict=True,
-        )
-        
-        # Use the last hidden state as VLM features
-        # This now contains fused vision-language representations
-        vlm_features = lm_outputs.last_hidden_state  # [B, max_seq_len, D]
-        
-        return {"vlm_features": vlm_features}
-
     # ================================= training =================================
+
     def forward(
         self,
-        input_ids: torch.LongTensor,        # [B, L] - tokenized language instruction
-        image_input: torch.FloatTensor,     # [B, V, C, H, W]
-        image_mask: torch.Tensor,           # [B, V]
-        proprio: torch.Tensor,              # [B, dim_proprio]
-        action: torch.Tensor,               # [B, T=num_actions, D=dim_action]
+        input_ids: torch.LongTensor,
+        image_input: torch.FloatTensor,     # [B, V, C, H, W] or [B, V, T, C, H, W]
+        image_mask: torch.Tensor,
+        proprio: torch.Tensor,
+        action: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         """
-        Flow Matching training.
-        
-        1) Time sampling: t ~ Beta(1.5, 1) * 0.999 + 0.001
-        2) Interpolation: x_t = t * noise + (1-t) * actions
-        3) Target: velocity u_t = noise - actions
-        4) Model predicts v_t, compute MSE(v_t, u_t)
+        Flow Matching training forward.
+
+        1) t ~ Beta(1.5, 1) * 0.999 + 0.001
+        2) x_t = t * noise + (1-t) * action_norm
+        3) u_t = noise - action_norm
+        4) v_t = transformer(vlm_features, x_t, t, proprio_norm)
+        5) loss = MSE(v_t, u_t)
         """
         enc = self.forward_vlm_efficient(image_input, image_mask, input_ids)
 
         B = input_ids.shape[0]
         device = input_ids.device
-        
-        # Beta(1.5, 1) time sampling
+
         beta_dist = torch.distributions.Beta(
-            torch.tensor(1.5, device=device), 
+            torch.tensor(1.5, device=device),
             torch.tensor(1.0, device=device)
         )
         t = beta_dist.sample((B,)) * 0.999 + 0.001
 
-        # Normalize action and proprio
-        if hasattr(self.action_space, 'normalize_action'):
+        if hasattr(self.action_space, "normalize_action"):
             action_norm = self.action_space.normalize_action(action)
-        elif hasattr(self.action_space, 'normalize'):
+        elif hasattr(self.action_space, "normalize"):
             action_norm = self.action_space.normalize(action)
         else:
             action_norm = action
-            
-        if hasattr(self.action_space, 'normalize_state'):
+
+        if hasattr(self.action_space, "normalize_state"):
             proprio_norm = self.action_space.normalize_state(proprio)
-        elif hasattr(self.action_space, 'normalize'):
+        elif hasattr(self.action_space, "normalize"):
             proprio_norm = self.action_space.normalize(proprio)
         else:
             proprio_norm = proprio
-        
-        # Flow Matching
+
         noise = torch.randn_like(action_norm)
         t_expanded = t.view(-1, 1, 1)
         x_t = t_expanded * noise + (1 - t_expanded) * action_norm
         u_t = noise - action_norm
 
-        # Model prediction (no aux_visual_inputs for SmolVLM)
         v_t = self.transformer(
             vlm_features=enc["vlm_features"],
             action_with_noise=x_t,
             t=t,
             proprio=proprio_norm,
         )
-        
-        # MSE loss
+
         velocity_loss = torch.mean(torch.square(v_t - u_t))
-        
         return {"velocity_loss": velocity_loss}
 
     # ================================= inference =================================
+
     @torch.no_grad()
     def generate_actions(
         self,
@@ -393,15 +306,7 @@ class SmolVLMVLA(PreTrainedModel):
         proprio: torch.Tensor,
         steps: int = 10,
     ) -> torch.Tensor:
-        """
-        Flow Matching inference (Euler integration).
-        
-        1) Initialize x_t = noise (t=1)
-        2) Loop t from 1 to 0:
-           - Model predicts velocity v_t
-           - Euler update: x_t = x_t + dt * v_t
-        3) Final x_0 ≈ target action
-        """
+        """Flow Matching inference (Euler integration)."""
         self.eval()
         enc = self.forward_vlm_efficient(image_input, image_mask, input_ids)
 
@@ -410,37 +315,34 @@ class SmolVLMVLA(PreTrainedModel):
         device = proprio.device
         dtype = proprio.dtype
 
-        # Normalize proprio
-        if hasattr(self.action_space, 'normalize_state'):
+        if hasattr(self.action_space, "normalize_state"):
             proprio_norm = self.action_space.normalize_state(proprio)
-        elif hasattr(self.action_space, 'normalize'):
+        elif hasattr(self.action_space, "normalize"):
             proprio_norm = self.action_space.normalize(proprio)
         else:
             proprio_norm = proprio
 
-        # Euler integration
         steps = max(1, int(steps))
         dt = -1.0 / steps
-        
+
         x_t = torch.randn(B, self.num_actions, D, device=device, dtype=dtype)
         t = 1.0
-        
+
         while t > -dt / 2:
             t_tensor = torch.full((B,), t, device=device, dtype=dtype)
-            
             v_t = self.transformer(
                 vlm_features=enc["vlm_features"],
                 action_with_noise=x_t,
                 proprio=proprio_norm,
                 t=t_tensor,
             )
-        
             x_t = x_t + dt * v_t
             t = t + dt
-        
+
         return self.action_space.postprocess(x_t)
 
     # =============================== FastAPI service =============================
+
     def _build_app(self, processor):
         """Build FastAPI app for SmolVLM-VLA inference."""
         if self.app is not None:
@@ -452,7 +354,6 @@ class SmolVLMVLA(PreTrainedModel):
         def act(payload: Dict[str, Any]):
             try:
                 self.eval()
-                # Decode images
                 images = []
                 for key in ("image0", "image1", "image2"):
                     if key not in payload:
@@ -466,19 +367,16 @@ class SmolVLMVLA(PreTrainedModel):
                         images.append(Image.fromarray(np.array(v)))
                     elif isinstance(v, str):
                         images.append(Image.open(v))
-                        
+
                 if not images:
                     return JSONResponse({"error": "No valid images found."}, status_code=400)
 
-                # Process inputs
                 inputs = processor(images, payload["language_instruction"])
                 if not {"input_ids", "image_input", "image_mask"}.issubset(inputs):
                     return JSONResponse({"error": "Processor returned incomplete inputs."}, status_code=400)
 
-                # Build proprio tensor
                 proprio = torch.as_tensor(np.asarray(json_numpy.loads(payload["proprio"])))
 
-                # Align to model device/dtype
                 device = next(self.parameters()).device
                 dtype = next(self.parameters()).dtype
 
@@ -490,7 +388,6 @@ class SmolVLMVLA(PreTrainedModel):
                 inputs = {k: to_model(v) for k, v in inputs.items()}
                 inputs["proprio"] = to_model(proprio.unsqueeze(0))
 
-                # Inference
                 steps = int(payload.get("steps", 10))
                 action = self.generate_actions(**inputs, steps=steps).squeeze(0).float().cpu().numpy()
                 return JSONResponse({"action": action.tolist()})
