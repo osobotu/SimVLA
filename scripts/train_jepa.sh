@@ -18,6 +18,7 @@
 
 #SBATCH --job-name=simvla_jepa
 #SBATCH --partition=GPU-shared
+#SBATCH --nodes=1
 #SBATCH --gpus=l40s-48:4
 #SBATCH -t 48:00:00
 #SBATCH -A cis260130p
